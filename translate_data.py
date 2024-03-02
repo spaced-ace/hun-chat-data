@@ -1,5 +1,6 @@
 import os
 import csv
+import tqdm
 import httpx
 import dotenv
 import asyncio
@@ -97,7 +98,12 @@ async def main(api_key, continue_from=None):
         df = df.iloc[last_idx[0] :]
     async with httpx.AsyncClient(timeout=15) as session:
         in_flight = []
-        for _, row in df.iterrows():
+        for _, row in tqdm.tqdm(
+            df.iterrows(),
+            total=len(df),
+            desc='Translating',
+            unit='message',
+        ):
             text = row['text']
             prompt = convert_text_to_prompt(text)
             in_flight.append(
@@ -105,6 +111,7 @@ async def main(api_key, continue_from=None):
             )
             if len(in_flight) == 5:
                 responses = await asyncio.gather(*in_flight)
+                await asyncio.sleep(0.2)
                 failed_count = len(
                     [response for response in responses if response[1] is None]
                 )
