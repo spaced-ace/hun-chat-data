@@ -59,13 +59,19 @@ def convert_text_to_prompt(text):
     Hungarian:"""
 
 
-def checkpoint_response_csv(row, response_text):
+DATA_FOLDER = 'data'
+OASST_CSV = os.path.join(DATA_FOLDER, 'oasst1-en.csv')
+TRANSLATED_CSV = os.path.join(DATA_FOLDER, 'oasst1-en-hu.csv')
+PATCHED_CSV = os.path.join(DATA_FOLDER, 'oasst1-en-hu-patched.csv')
+
+
+def checkpoint_response_csv(csv_name, row, response_text):
     # if the file does not exist, create it and write the header
-    if not os.path.exists('data/oasst1-en-hu.csv'):
-        with open('data/oasst1-en-hu.csv', 'w') as file:
+    if not os.path.exists(csv_name):
+        with open(csv_name, 'w') as file:
             writer = csv.writer(file, quoting=csv.QUOTE_NONNUMERIC)
             writer.writerow(list(row.index) + ['hungarian_translation'])
-    with open('data/oasst1-en-hu.csv', 'a') as file:
+    with open(csv_name, 'a') as file:
         writer = csv.writer(file, quoting=csv.QUOTE_NONNUMERIC)
         writer.writerow([*row.values, response_text])
 
@@ -91,12 +97,38 @@ async def bundle_row_and_request(row, session, api_key, prompt):
     return (row, req)
 
 
-async def main(api_key, continue_from=None):
-    df = pd.read_csv('data/oasst1-en.csv', quoting=csv.QUOTE_NONNUMERIC)
+async def main(api_key, continue_from=None, patch_failed=False, timeout=15):
+    original_csv = OASST_CSV
+    df = pd.read_csv(original_csv, quoting=csv.QUOTE_NONNUMERIC)
     if continue_from is not None:
         last_idx = df.query(f'message_id == "{continue_from}"').index
         df = df.iloc[last_idx[0] :]
-    async with httpx.AsyncClient(timeout=15) as session:
+    output_csv = TRANSLATED_CSV
+    if patch_failed:
+        output_csv = PATCHED_CSV
+        translated_df = pd.read_csv(
+            TRANSLATED_CSV, quoting=csv.QUOTE_NONNUMERIC
+        )
+        failed = translated_df[
+            translated_df['hungarian_translation'].isna()
+            | translated_df['hungarian_translation'].str.contains('BLOCKED')
+        ]
+        successful = translated_df[
+            ~(
+                translated_df['hungarian_translation'].isna()
+                | translated_df['hungarian_translation'].str.contains(
+                    'BLOCKED'
+                )
+            )
+        ]
+        successful.to_csv(
+            output_csv,
+            index=False,
+            quoting=csv.QUOTE_NONNUMERIC,
+        )
+        df = df.loc[df['message_id'].isin(failed['message_id'])]
+        timeout = timeout * 2
+    async with httpx.AsyncClient(timeout=timeout) as session:
         in_flight = []
         for _, row in tqdm.tqdm(
             df.iterrows(),
@@ -118,9 +150,15 @@ async def main(api_key, continue_from=None):
                 if failed_count == 5:
                     logging.error('5 failed requests in a row. Exiting.')
                     break
-                for row, translation in responses:
-                    checkpoint_response_csv(row, translation)
+                handle_responses(output_csv, responses)
                 in_flight = []
+        responses = await asyncio.gather(*in_flight)
+        handle_responses(output_csv, responses)
+
+
+def handle_responses(csv_name, responses):
+    for row, translation in responses:
+        checkpoint_response_csv(csv_name, row, translation)
 
 
 if __name__ == '__main__':
@@ -132,13 +170,30 @@ if __name__ == '__main__':
         help='Continue from where the last translation left off.',
         default=False,
     )
+    parser.add_argument(
+        '--patch-failed',
+        dest='patch_failed',
+        action='store_true',
+        help='Retries failed translations and patches the csv file.',
+        default=False,
+    )
+    parser.add_argument(
+        '--timeout',
+        dest='timeout',
+        type=int,
+        help='Timeout for the requests in seconds.',
+        default=15,
+    )
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO)
     last_message_id = None
+
     if args.continue_:
-        checkpoint = pd.read_csv('data/oasst1-en-hu.csv')
+        checkpoint = pd.read_csv(TRANSLATED_CSV, quoting=csv.QUOTE_NONNUMERIC)
         last_message_id = checkpoint.tail(1)['message_id'].item()
 
     dotenv.load_dotenv()
     api_key = os.getenv('GOOGLE_AI_API_KEY')
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(main(api_key, last_message_id))
+    asyncio.run(
+        main(api_key, last_message_id, args.patch_failed, args.timeout)
+    )
